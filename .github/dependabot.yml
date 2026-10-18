@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Keep every SHA-pinned GitHub Action in this repo (workflows + composite
+  # actions) up to date. This is what makes SHA-pinning maintainable instead
+  # of a one-time exercise that silently goes stale.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+
+  # Covers this repo's own package.json, if one is ever added (e.g. for
+  # local tooling/tests).
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "daily"
