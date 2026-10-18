@@ -1,0 +1,140 @@
+name: npm Security Gate (SonarCloud + Snyk, reusable)
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory containing package.json (for monorepos)
+        type: string
+        default: "."
+      node-version:
+        description: Node.js version used to install dependencies and run tests
+        type: string
+        default: "20"
+      package-manager:
+        description: One of npm, yarn, pnpm, or auto to detect from the lockfile
+        type: string
+        default: "auto"
+      sonar-project-key:
+        description: SonarCloud project key
+        type: string
+        required: true
+      sonar-organization:
+        description: SonarCloud organization key
+        type: string
+        required: true
+    secrets:
+      SONAR_TOKEN:
+        required: true
+      SNYK_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------
+  # This gate is meant to be compulsory (a required status check on main),
+  # so failures here are intentionally loud: missing package.json, missing
+  # test script, or a missing/invalid SONAR_TOKEN/SNYK_TOKEN all fail the
+  # job rather than skipping quietly.
+  # ---------------------------------------------------------------------
+  detect:
+    name: Detect environment
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      pm: ${{ steps.pm.outputs.pm }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fail fast if package.json or a test script is missing
+        shell: bash
+        run: |
+          if [ ! -f package.json ]; then
+            echo "::error::No package.json found in '${{ inputs.working-directory }}'"
+            exit 1
+          fi
+          has_test=$(node -e "console.log(!!(require('./package.json').scripts||{}).test)")
+          if [ "$has_test" != "true" ]; then
+            echo "::error::No 'test' script found. SonarCloud needs a coverage report to analyze; add a test script before this gate can run."
+            exit 1
+          fi
+
+      - name: Detect package manager
+        id: pm
+        shell: bash
+        run: |
+          if [ "${{ inputs.package-manager }}" != "auto" ]; then
+            echo "pm=${{ inputs.package-manager }}" >> "$GITHUB_OUTPUT"
+          elif [ -f pnpm-lock.yaml ]; then
+            echo "pm=pnpm" >> "$GITHUB_OUTPUT"
+          elif [ -f yarn.lock ]; then
+            echo "pm=yarn" >> "$GITHUB_OUTPUT"
+          else
+            echo "pm=npm" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------
+  sonarcloud:
+    name: SonarCloud quality gate
+    needs: detect
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager: ${{ needs.detect.outputs.pm }}
+          working-directory: ${{ inputs.working-directory }}
+          fetch-depth: "0"
+
+      - name: Run tests with coverage
+        run: ${{ needs.detect.outputs.pm }} test -- --coverage --coverageReporters=lcov
+
+      - name: SonarCloud Scan
+        uses: sonarsource/sonarcloud-github-action@ffc3010689be73b8e5ae0c57ce35968afd7909e8 # v5.0.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: ${{ inputs.working-directory }}
+          args: >
+            -Dsonar.projectKey=${{ inputs.sonar-project-key }}
+            -Dsonar.organization=${{ inputs.sonar-organization }}
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+
+  # ---------------------------------------------------------------------
+  snyk:
+    name: Snyk vulnerability scan
+    needs: detect
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager: ${{ needs.detect.outputs.pm }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/node@9adf32b1121593767fc3c057af55b55db032dc04 # v1.0.0
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --file=package.json --severity-threshold=high

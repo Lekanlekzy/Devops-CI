@@ -1,0 +1,293 @@
+name: npm CI (reusable, SLSA-aligned)
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory containing package.json (for monorepos)
+        type: string
+        default: "."
+      node-versions:
+        description: >
+          JSON array of Node.js versions for the test matrix. The first
+          entry is also used as the single version for the typecheck,
+          build, and bundle-size jobs.
+        type: string
+        default: '["20", "18", "22"]'
+      run-build:
+        description: Whether to run the build validation job
+        type: boolean
+        default: true
+      package-manager:
+        description: One of npm, yarn, pnpm, or auto to detect from the lockfile
+        type: string
+        default: "auto"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Detect package manager + which optional scripts/configs exist, so
+  # later jobs can skip gracefully instead of failing on repos that
+  # haven't set everything up yet.
+  # ---------------------------------------------------------------------
+  detect:
+    name: Detect environment
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      pm: ${{ steps.pm.outputs.pm }}
+      has-build: ${{ steps.scripts.outputs.has-build }}
+      has-test: ${{ steps.scripts.outputs.has-test }}
+      has-sizelimit: ${{ steps.scripts.outputs.has-sizelimit }}
+      has-tsconfig: ${{ steps.tsconfig.outputs.has-tsconfig }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fail fast if package.json is missing
+        shell: bash
+        run: |
+          if [ ! -f package.json ]; then
+            echo "::error::No package.json found in '${{ inputs.working-directory }}'"
+            exit 1
+          fi
+
+      - name: Detect package manager
+        id: pm
+        shell: bash
+        run: |
+          if [ "${{ inputs.package-manager }}" != "auto" ]; then
+            echo "pm=${{ inputs.package-manager }}" >> "$GITHUB_OUTPUT"
+          elif [ -f pnpm-lock.yaml ]; then
+            echo "pm=pnpm" >> "$GITHUB_OUTPUT"
+          elif [ -f yarn.lock ]; then
+            echo "pm=yarn" >> "$GITHUB_OUTPUT"
+          else
+            echo "pm=npm" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect available scripts and configs
+        id: scripts
+        shell: bash
+        run: |
+          node <<'EOF' >> "$GITHUB_OUTPUT"
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const scripts = pkg.scripts || {};
+          const deps = Object.assign({}, pkg.dependencies, pkg.devDependencies);
+          const lines = [
+            `has-build=${!!scripts.build}`,
+            `has-test=${!!scripts.test}`,
+            `has-sizelimit=${!!deps["size-limit"]}`,
+          ];
+          console.log(lines.join("\n"));
+          EOF
+
+      - name: Detect tsconfig.json
+        id: tsconfig
+        shell: bash
+        run: |
+          if [ -f tsconfig.json ]; then
+            echo "has-tsconfig=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-tsconfig=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------
+  typecheck:
+    name: Typecheck
+    needs: detect
+    if: needs.detect.outputs.has-tsconfig == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          node-version: ${{ fromJSON(inputs.node-versions)[0] }}
+          package-manager: ${{ needs.detect.outputs.pm }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: tsc --noEmit
+        run: npx --yes tsc --noEmit
+
+  # ---------------------------------------------------------------------
+  test:
+    name: Test (Node ${{ matrix.node-version }})
+    needs: detect
+    if: needs.detect.outputs.has-test == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ${{ fromJSON(inputs.node-versions) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          node-version: ${{ matrix.node-version }}
+          package-manager: ${{ needs.detect.outputs.pm }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Run tests
+        run: ${{ needs.detect.outputs.pm }} test
+
+  # ---------------------------------------------------------------------
+  build:
+    name: Build, package validation & SBOM
+    needs: detect
+    if: inputs.run-build && needs.detect.outputs.has-build == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          node-version: ${{ fromJSON(inputs.node-versions)[0] }}
+          package-manager: ${{ needs.detect.outputs.pm }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Run build script
+        run: ${{ needs.detect.outputs.pm }} run build
+
+      - name: Validate publishable package (publint)
+        run: npx --yes publint
+
+      - name: Preview packable contents
+        run: npm pack --dry-run
+
+      - name: Validate type definitions (arethetypeswrong)
+        run: npx --yes @arethetypeswrong/cli --pack . || true
+
+      - name: Pack tarball
+        run: npm pack --pack-destination ./artifact-tarball
+
+      - name: Generate SBOM (CycloneDX)
+        run: npx --yes @cyclonedx/cdxgen@^10 -o sbom.cdx.json
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-tarball
+          path: ${{ inputs.working-directory }}/artifact-tarball/*.tgz
+          retention-days: 7
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom
+          path: ${{ inputs.working-directory }}/sbom.cdx.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------
+  bundle-size:
+    name: Bundle size check
+    needs: detect
+    if: needs.detect.outputs.has-sizelimit == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+        with:
+          node-version: ${{ fromJSON(inputs.node-versions)[0] }}
+          package-manager: ${{ needs.detect.outputs.pm }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Run size-limit
+        run: npx --yes size-limit
+
+  # ---------------------------------------------------------------------
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@cc4f6536e38d1126c5e3b0683d469a14f23bfea4 # v3.1.0
+
+  # ---------------------------------------------------------------------
+  scorecard:
+    name: OSSF Scorecard
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard analysis
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload Scorecard SARIF
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          sarif_file: results.sarif
+
+  # ---------------------------------------------------------------------
+  provenance:
+    name: SLSA build provenance & SBOM attestation
+    needs: [detect, build]
+    if: inputs.run-build && needs.detect.outputs.has-build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download tarball artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-tarball
+          path: artifact-tarball
+
+      - name: Download SBOM artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sbom
+          path: sbom
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.0.0
+        with:
+          subject-path: artifact-tarball/*.tgz
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.0.0
+        with:
+          subject-path: artifact-tarball/*.tgz
+          sbom-path: sbom/sbom.cdx.json
